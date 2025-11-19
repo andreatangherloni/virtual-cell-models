@@ -1,0 +1,239 @@
+# ============================================================================
+# DEVAE Stage 1 Training Configuration
+# ============================================================================
+# This is the initial training stage where all components are trained together
+# from scratch (or from pretrained gene embeddings).
+# ============================================================================
+
+data:
+  # Input data paths
+  train_h5ad: "data/adata_Training.h5ad"
+  val_h5ad: null         # Optional validation set
+  fewshot_h1_h5ad: null  # Optional H1 few-shot data
+  
+  # Column names in AnnData.obs
+  col_target: "target_gene"
+  col_batch: "batch"
+  col_celltype: "cell_type"
+  col_is_h1: "is_H1"
+  control_token: "non-targeting"
+  
+  # Preprocessing
+  zscore: false        # Don't z-score (keep in log1p space)
+  normalize: true      # Apply log1p normalization
+  target_sum: null     # null = median normalization
+  drop_all_zero: false # Filter all-zero genes
+  
+  # Data loading
+  num_workers: 8
+  pin_memory: true
+
+
+# ========================================================================
+# Core Architecture
+# ========================================================================  
+model:
+  
+  # Dimensions (input_dim will be auto-detected from data)
+  input_dim: null  # Auto-detected (e.g., 18080 genes)
+  latent_dim: 128
+  hidden_dims: [1536, 768, 384]  # High → Low
+  context_dim: 256
+  gene_embed_dim: 128
+  
+  # ResidualMLP with skip connections
+  use_residual_mlp: true # Better gradient flow!
+  use_input_skip: true   # Concatenate input at each stage
+  
+  # Regularization
+  dropout: 0.2
+  layernorm: true
+  
+  # ========================================================================
+  # Attention Mechanism
+  # ========================================================================
+  num_attention_heads: 4
+  attention_dropout: 0.1
+  use_attention: true
+  attention_mixing_alpha: 0.5  # Learnable parameter initial value
+  
+  # Delta prediction
+  delta_type: "attention"  # "attention" or "hyper"
+  delta_rank: 8
+  hyperdelta_use_ln: true
+  
+  # ========================================================================
+  # Decoder
+  # ========================================================================
+  use_film_in_decoder: true
+  bound_mode: "tanh"  # Output bounding
+  output_min: 0.0
+  output_max: 8.0
+  
+  # ========================================================================
+  # Count Head (for accurate count modeling)
+  # ========================================================================
+  use_count_head: true
+  count_link: "nb"  # "poisson", "nb", or "zinb"
+  nb_theta: 10.0    # NB dispersion (smaller = heavier tails)
+  zinb_pi_hidden: 128
+  attention_modulated_counts: true  # Use attention to modulate rates
+  
+  # ========================================================================
+  # Gene Embeddings
+  # ========================================================================
+  pretrained_gene_emb_path: "data/ESM2_pert_features.pt"  # null if not using
+  pretrained_norm: "l2"  # "l2" or "none"
+  pretrained_case_insensitive: true
+  use_pca_init: false  # Use pretrained instead
+  
+  # ========================================================================
+  # Library Size Covariate
+  # ========================================================================
+  use_libsize_covariate: true
+  libsize_proj_hidden: 128
+  
+  # VAE variance options
+  logvar_min: -4.0
+  logvar_max: 2.0
+  use_softplus_var: true  # Smooth positive variance!
+  
+  # Neighbor mixing (used during inference)
+  neighbor_mix_k: 12
+  neighbor_mix_tau: 0.07
+  neighbor_mix_include_self: true
+
+
+train:
+  # ========================================================================
+  # I/O
+  # ========================================================================
+  
+  pretrained_outdir: null  # null for stage 1 (training from scratch)
+  outdir: "outputs/stage1"
+  ckpt_name: "model.pt"
+  seed: 42
+  
+  # ========================================================================
+  # Training Schedule
+  # ========================================================================
+  
+  epochs_warmup: 0  # No warmup for stage 1
+  kl_warmup_epochs: 10  # Gradually increase KL weight
+  epochs_main: 50
+  
+  # ========================================================================
+  # Optimization
+  # ========================================================================
+  
+  batch_size: 128
+  lr: 2.0e-4
+  weight_decay: 5.0e-2
+  grad_clip: 1.0
+  huber_delta: 0.5  # Huber loss delta for reconstruction
+  amp: false  # Automatic mixed precision (set true for faster training)
+  reset_optimizer: false
+  
+  # ========================================================================
+  # Freezing (all false for stage 1 - train everything!)
+  # ========================================================================
+  
+  freeze_enc_c: false
+  freeze_enc_p: false
+  freeze_decoder_main: false
+  freeze_count_head: false
+  freeze_zinb_head: false
+  freeze_delta_module: false
+  freeze_attention: false
+  freeze_adapter: false
+  freeze_gene_emb: false
+  freeze_batch_emb: false
+  freeze_ct_emb: false
+  freeze_h1_emb: false
+  freeze_lib_proj: false
+  
+  # ========================================================================
+  # Loss Weights (Stage 1: Balanced training)
+  # ========================================================================
+  
+  # Main losses
+  lambda_rec: 0.70  # Reconstruction
+  lambda_kl: 0.02  # KL divergence (will be warmed up)
+  lambda_xrec: 0.10  # Cross-reconstruction
+  lambda_delta: 0.15  # Delta consistency
+  
+  # Auxiliary losses (off for stage 1)
+  lambda_orth: 0.0
+  lambda_nce: 0.0
+  lambda_smooth: 0.0
+  lambda_mmd: 0.0
+  
+  # ✅ Count losses (using real counts!)
+  lambda_count_rec: 0.30  # Count reconstruction
+  lambda_count_xrec: 0.10  # Count cross-reconstruction
+  
+  # Competition losses (enable in stage 2+)
+  lambda_attention_focus: 0.0  # Stage 2+
+  lambda_topk_supervision: 0.0  # Stage 3
+  lambda_lfc_magnitude: 0.0
+  
+  # Auxiliary hyperparameters
+  nce_temperature: 0.2
+  smooth_k: 8
+  count_max_rate: 60000.0
+  
+  # ZINB regularization
+  lambda_zinb_pi_reg: 1.0e-4
+  zinb_pi_reg_type: "l2_logit"
+  zinb_beta_a: 1.0
+  zinb_beta_b: 9.0
+  
+  # Gene weighting
+  compute_gene_weights: false
+  
+  # ========================================================================
+  # EMA and Scheduler (✅ Enhanced!)
+  # ========================================================================
+  
+  use_ema: true
+  ema_decay: 0.999
+  use_cosine: true  # ✅ CosineWithWarmup scheduler!
+  warmup_frac: 0.10  # 10% of steps for warmup
+  min_lr_ratio: 0.01  # Min LR = 1% of base LR
+  
+  # Pretrained embedding learning rate scaling
+  pretrained_freeze_epochs: 0
+  pretrained_emb_lr_scale: 0.05  # 5% of main LR for embeddings
+  
+  # ========================================================================
+  # Logging & Checkpointing
+  # ========================================================================
+  
+  log_every: 20  # Log every N batches
+  save_every: 5  # Save checkpoint every N epochs
+  resume_from: null
+  early_stop_patience: 30
+
+
+predict:
+  # ========================================================================
+  # Prediction Configuration (for stage 1 validation)
+  # ========================================================================
+  
+  test_h5ad: "data/adata_Test.h5ad"
+  output_h5ad: "outputs/stage1/predictions.h5ad"
+  ckpt_path: "outputs/stage1/best_model.pt"
+  
+  batch_size: 256
+  use_ema: true
+  delta_gain: 1.0  # No scaling for stage 1
+  
+  # ✅ Neighbor mixing (enable for final prediction!)
+  use_neighbor_mixing: false  # false for stage 1 (not needed yet)
+  neighbor_mix_k: 8
+  neighbor_mix_tau: 0.07
+  neighbor_mix_include_self: true
+  
+  # Inference options
+  compute_attention_maps: true
+  n_samples: 1  # >1 for uncertainty estimation
