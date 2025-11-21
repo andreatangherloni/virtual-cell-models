@@ -11,6 +11,8 @@ class DataConfig:
     train_h5ad: str = "data/adata_Training.h5ad"
     val_h5ad: Optional[str] = None
     fewshot_h1_h5ad: Optional[str] = None
+    control_pool_h5ad: Optional[str] = None
+
     
     # Column names in AnnData.obs
     col_target: str = "target_gene"
@@ -182,24 +184,68 @@ class TrainConfig:
 
 @dataclass
 class PredictConfig:
-    """Prediction/inference configuration."""
-    test_h5ad: str = "data/adata_Test.h5ad"
-    output_h5ad: str = "predictions.h5ad"
-    ckpt_path: str = "outputs/default/model.pt"
+    """Prediction/inference configuration for competition submission."""
     
+ # ========================================================================
+    # Input/Output Paths
+    # ========================================================================
+    ckpt_path: str = "outputs/default/best_model.pt"
+    perturb_list_csv: str = "data/test_perturbations.csv"   # CSV: target_gene, n_cells, [median_umi_per_cell]
+    out_h5ad: str = "predictions.h5ad"                      # Output path
+    gene_order_file: Optional[str] = None                   # Optional gene ordering file
+    
+    
+    # ========================================================================
+    # Model Inference Settings
+    # ========================================================================
     batch_size: int = 256
-    use_ema: bool = True
-    delta_gain: float = 1.0  # Scale delta predictions
+    use_ema: bool = True              # Use EMA weights if available
+    delta_gain: float = 1.0           # Scale delta predictions
+    n_samples: int = 1                # Number of samples from latent (>1 for uncertainty)
     
-    # Neighbor mixing for unseen genes at inference
-    use_neighbor_mixing: bool = False      # Enable for unseen perturbations
-    neighbor_mix_k: int = 8                # Number of nearest neighbors
-    neighbor_mix_tau: float = 0.07         # Softmax temperature
-    neighbor_mix_include_self: bool = True # Include query gene in mixture
+    # ========================================================================
+    # Neighbor Mixing (for unseen genes)
+    # ========================================================================
+    neighbor_mix_k: int = 12                # Number of nearest neighbors
+    neighbor_mix_tau: float = 0.07          # Softmax temperature
+    neighbor_mix_include_self: bool = True  # Include query gene in mixture
     
-    # Inference mode
-    compute_attention_maps: bool = True  # Save attention for analysis
-    n_samples: int = 1  # Number of samples from latent (>1 for uncertainty)
+    # ========================================================================
+    # Control Cell Settings
+    # ========================================================================
+    h1_flag_value: int = 1            # Value indicating H1 cells in col_is_h1
+    n_control_cells: int = 0          # Number of real controls to include (0=none, -1=all)
+    
+    # ========================================================================
+    # Output Format
+    # ========================================================================
+    output_scale: str = "counts"      # "counts" or "log1p"
+    compression: str = "gzip"         # H5AD compression
+    
+    # ========================================================================
+    # Count Sampling (when output_scale='counts')
+    # ========================================================================
+    count_link: str = "nb"            # "nb", "poisson", or "round"
+    nb_theta: float = 10.0            # NB dispersion parameter
+    count_max_rate: float = 60000.0   # Maximum rate for count sampling
+    
+    # Depth matching
+    depth_column: str = "median_umi_per_cell"  # Column in CSV for target depth
+    
+    # Rate shaping
+    rate_sharpen_beta: float = 1.0    # Exponent for rate sharpening (1.0=no sharpening)
+    mix_sharpen_p: float = 0.0        # Mixing proportion for sharpened rates
+    
+    # Post-processing
+    topk_keep_only: Optional[int] = None      # Keep only top-K genes (None=keep all)
+    prune_quantile: Optional[float] = None    # Prune genes below quantile (None=no pruning)
+    topk_boost_k: int = 0                     # Number of top genes to boost (0=no boosting)
+    topk_boost_gamma: float = 1.0             # Boost factor for top-K genes
+    
+    # ========================================================================
+    # Analysis
+    # ========================================================================
+    compute_attention_maps: bool = False  # Save attention for analysis (not implemented yet)
 
 
 @dataclass

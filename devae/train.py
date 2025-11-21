@@ -311,9 +311,8 @@ def train(cfg: Config):
     print(f"- Batches: {num_batches}")
     print(f"- Cell types: {num_celltypes}")
     
-    # Save mappings (only if new)
-    if gene_to_idx is None:
-        dataset.save_mappings(cfg.train.outdir)
+    # Save mappings
+    dataset.save_mappings(cfg.train.outdir)
     
     # ========================================================================
     # MODEL
@@ -330,9 +329,14 @@ def train(cfg: Config):
     model._set_gene_names(gene_names)
     model._init_context_embeddings(num_batches, num_celltypes)
     
-    # Load pretrained gene embeddings
-    if cfg.model.pretrained_gene_emb_path:
+    loading_checkpoint = ((cfg.train.resume_from is not None and cfg.train.resume_from) or
+                          (cfg.train.pretrained_outdir is not None))
+    
+    # Only load ESM2 if starting fresh (no checkpoint)
+    if cfg.model.pretrained_gene_emb_path and not loading_checkpoint:
         model._init_gene_embeddings(cfg.model.pretrained_gene_emb_path)
+    elif loading_checkpoint:
+        print("[gene_emb] Loading from checkpoint → using trained embeddings")
     
     # ========================================================================
     # CHECKPOINT LOADING (WITH PROPER RESUME vs FINE-TUNE)
@@ -350,7 +354,7 @@ def train(cfg: Config):
         resume_path = Path(cfg.train.resume_from)
         if resume_path.exists():
             print(f"Loading checkpoint: {resume_path}")
-            ckpt = torch.load(resume_path, map_location=device)
+            ckpt = torch.load(resume_path, map_location=device,  weights_only=False)
             
             # Load model weights
             missing, unexpected = model.load_state_dict(ckpt['model_state_dict'], strict=False)
@@ -373,7 +377,7 @@ def train(cfg: Config):
         ckpt_path = Path(cfg.train.pretrained_outdir) / "best_model.pt"
         if ckpt_path.exists():
             print(f"Loading pretrained: {ckpt_path.name}")
-            ckpt = torch.load(ckpt_path, map_location=device)
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
             
             # Load model weights
             missing, unexpected = model.load_state_dict(ckpt['model_state_dict'], strict=False)
@@ -529,8 +533,7 @@ def train(cfg: Config):
     # COMPLETE
     # ========================================================================
     
-    print(f"\n")
-    print(f"TRAINING COMPLETED")
+    print(f"\nTRAINING COMPLETED")
     print(f"- Best loss: {best_loss:.6f}")
     print(f"- Saved to: {outdir / 'best_model.pt'}")
     print(f"{'='*80}")

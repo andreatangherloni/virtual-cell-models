@@ -447,7 +447,7 @@ class AttentionEnhancedDualEncoderVAE(nn.Module):
                 if 'embeddings' in pretrained:
                     pretrained = pretrained['embeddings']
                 
-                # ✅ NEW: Handle dictionary format {'gene_name': tensor}
+                # NEW: Handle dictionary format {'gene_name': tensor}
                 if all(isinstance(k, str) for k in list(pretrained.keys())[:10]):
                     print(f"[gene_emb] Detected dictionary format with gene names")
                     emb_dict = pretrained

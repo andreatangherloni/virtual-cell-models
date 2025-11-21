@@ -14,7 +14,7 @@ __author__ = "Andrea Tangherloni"
 from .config import Config, DataConfig, ModelConfig, TrainConfig, PredictConfig
 from .vae import AttentionEnhancedDualEncoderVAE
 from .train import train
-from .predict import predict, predict_with_uncertainty
+from .predict import predict
 from .data import PerturbationDataset, get_dataloader
 from .modules import (
     ResidualMLP,
@@ -39,7 +39,6 @@ __all__ = [
     # Training and prediction
     'train',
     'predict',
-    'predict_with_uncertainty',
     
     # Data handling
     'PerturbationDataset',

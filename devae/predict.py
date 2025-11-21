@@ -1,356 +1,584 @@
 """
-Inference for AE-DEVAE.
-Enhanced with neighbor mixing for unseen genes and better prediction workflow.
+Inference for AE-DEVAE
+Enhanced with competition submission workflow
 """
 import torch
 import numpy as np
+import pandas as pd
 import scanpy as sc
 from pathlib import Path
 from tqdm import tqdm
+from scipy import sparse
+from typing import Optional, Dict, Tuple
+import json
 
 from .config import Config
 from .vae import AttentionEnhancedDualEncoderVAE
-from .data import get_dataloader, PerturbationDataset
+from .data import load_control_pool
+
 
 def get_device():
+    """Get best available device (CUDA > MPS > CPU)."""
     if torch.cuda.is_available():
         return torch.device("cuda")
     elif torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
 
+
+def batched(iterable, n):
+    """Yield successive n-sized chunks from iterable."""
+    items = list(iterable)
+    for i in range(0, len(items), n):
+        yield items[i:i + n]
+
+
+def sample_counts_from_log1p(X_hat_log1p: np.ndarray, target_depth: float, cfg) -> np.ndarray:
+    """
+    Sample counts from log1p predictions using Negative Binomial.
+    
+    Args:
+        X_hat_log1p: [n_cells, n_genes] predictions in log1p space
+        target_depth: Target median depth for sampling
+        cfg: PredictConfig
+    
+    Returns:
+        [n_cells, n_genes] count matrix (int32)
+    """
+    # Convert back to rates
+    rates = np.expm1(X_hat_log1p)  # log1p -> raw scale
+    
+    # Normalize to target depth
+    current_depths = rates.sum(axis=1, keepdims=True)
+    rates = rates / (current_depths + 1e-8) * target_depth
+    
+    # Apply rate shaping if configured
+    rate_sharpen_beta = getattr(cfg, 'rate_sharpen_beta', 1.0)
+    mix_sharpen_p = getattr(cfg, 'mix_sharpen_p', 0.0)
+    
+    if rate_sharpen_beta != 1.0:
+        rates_sharp = np.power(rates, rate_sharpen_beta)
+        rates = (1 - mix_sharpen_p) * rates + mix_sharpen_p * rates_sharp
+    
+    # Clip rates
+    count_max_rate = getattr(cfg, 'count_max_rate', None)
+    if count_max_rate is not None:
+        rates = np.clip(rates, 0, count_max_rate)
+    
+    # Sample from NB
+    count_link = getattr(cfg, 'count_link', 'nb')
+    if count_link == 'nb':
+        theta = getattr(cfg, 'nb_theta', 10.0)
+        p = theta / (theta + rates + 1e-8)
+        counts = np.random.negative_binomial(theta, p)
+    elif count_link == 'poisson':
+        counts = np.random.poisson(rates)
+    else:
+        # Fallback: round rates
+        counts = np.rint(rates)
+    
+    # Apply top-k/pruning if configured
+    topk_keep_only = getattr(cfg, 'topk_keep_only', None)
+    if topk_keep_only is not None and topk_keep_only > 0:
+        for i in range(counts.shape[0]):
+            topk_idx = np.argsort(counts[i])[-topk_keep_only:]
+            mask = np.zeros(counts.shape[1], dtype=bool)
+            mask[topk_idx] = True
+            counts[i, ~mask] = 0
+    
+    prune_quantile = getattr(cfg, 'prune_quantile', None)
+    if prune_quantile is not None and prune_quantile > 0:
+        for i in range(counts.shape[0]):
+            thresh = np.quantile(counts[i], prune_quantile)
+            counts[i, counts[i] < thresh] = 0
+    
+    # Apply top-k boosting if configured
+    topk_boost_k = getattr(cfg, 'topk_boost_k', 0)
+    topk_boost_gamma = getattr(cfg, 'topk_boost_gamma', 1.0)
+    
+    if topk_boost_k > 0 and topk_boost_gamma != 1.0:
+        for i in range(counts.shape[0]):
+            topk_idx = np.argsort(counts[i])[-topk_boost_k:]
+            counts[i, topk_idx] = np.rint(counts[i, topk_idx] * topk_boost_gamma)
+    
+    return counts.astype(np.int32)
+
+
+import pandas as pd
+import scanpy as sc
+
+def reorder_genes(adata: sc.AnnData, gene_order_file: str) -> sc.AnnData:
+    """
+    Reorder genes according to a gene order file using vectorized operations.
+    
+    Args:
+        adata: AnnData object
+        gene_order_file: Path to text file with gene names (one per line)
+    
+    Returns:
+        Reordered AnnData
+    """
+    # 1. Fast Load: Use pandas to read file (faster than looping over lines)
+    target_genes = pd.read_csv(gene_order_file, header=None, dtype=str).iloc[:, 0].values
+    target_idx = pd.Index(target_genes)
+    
+    # 2. Fast Lookup: isin() uses hash tables (O(1) lookup per gene)
+    mask_present = target_idx.isin(adata.var_names)
+    
+    # 3. Split using boolean masking (vectorized)
+    matched = target_idx[mask_present]
+    missing_count = len(target_idx) - len(matched)
+    
+    if missing_count > 0:
+        print(f"⚠ Gene order: {missing_count}/{len(target_genes)} genes missing from predictions")
+    
+    # 4. Reorder
+    return adata[:, matched].copy()
+
+
+def mix_params_for_target(
+    tg: str,
+    gene2id: Dict[str, int],
+    control_token: str,
+    default_k: int,
+    default_tau: float,
+    seen_k: int = 0,
+    seen_tau: Optional[float] = None
+) -> Tuple[int, float]:
+    """
+    Determine neighbor mixing parameters for a target gene.
+    
+    Args:
+        tg: Target gene name
+        gene2id: Gene vocabulary
+        control_token: Control token string
+        default_k: Default k for unseen genes
+        default_tau: Default tau for unseen genes
+        seen_k: k for seen genes (0 = use default)
+        seen_tau: tau for seen genes (None = use default)
+    
+    Returns:
+        (k, tau) tuple
+    """
+    gid = gene2id.get(tg, 0)
+    
+    if gid == 0 or tg == control_token:
+        # Control or unseen → no mixing needed
+        return 0, 1.0
+    
+    # Check if gene was seen during training (has non-zero embedding)
+    # For simplicity, use default mixing for all
+    # In practice, you might want different k for seen vs unseen
+    if seen_k > 0 and seen_tau is not None:
+        return seen_k, seen_tau
+    else:
+        return default_k, default_tau
+
+
 @torch.no_grad()
 def predict(cfg: Config):
     """
-    Generate predictions on test data.
+    Generate predictions for competition submission.
     
-    Enhanced with:
-    - Neighbor mixing for unseen genes
-    - Vocabulary mapping consistency
-    - Attention map saving
-    - Multiple sampling options
+    Workflow:
+    1. Load checkpoint and model
+    2. Load control cell pool with depth statistics
+    3. Encode control cells
+    4. Load perturbation list
+    5. Generate perturbed cells
+    6. Assemble and save output
     """
     device = get_device()
     
-    print(f"{'─'*60}")
-    print(f"PREDICTING PROCEDURE")
-    print(f"{'─'*60}")
+    print(f"{'─'*80}")
+    print(f"PREDICTION PROCEDURE")
+    print(f"{'─'*80}")
+    print(f"- Output: {cfg.predict.out_h5ad}")
     print(f"- Device: {device}")
-    
-    print(f"Loading checkpoint from {cfg.predict.ckpt_path}")
+    print(f"- Scale: {cfg.predict.output_scale}\n")
     
     # ========================================================================
-    # LOAD MODEL
+    # CHECKPOINT & MODEL
     # ========================================================================
     
-    ckpt = torch.load(cfg.predict.ckpt_path, map_location=device)
+    print(f"{'─'*80}")
+    print(f"CHECKPOINT")
+    print(f"{'─'*80}")
+    
+    ckpt_path = Path(cfg.predict.ckpt_path)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     
     if 'config' in ckpt:
         model_cfg = ckpt['config'].model
-        print(f"Using model config from checkpoint")
     else:
         model_cfg = cfg.model
-        print(f"Using model config from current config")
     
+    # Load vocabulary mappings
+    ckpt_dir = ckpt_path.parent
+    mapping_path = ckpt_dir / 'vocab_mappings.json'
+    
+    if not mapping_path.exists():
+        raise FileNotFoundError(f"vocab_mappings.json not found at {mapping_path}")
+    
+    with open(mapping_path, 'r') as f:
+        mappings = json.load(f)
+    
+    gene_to_idx = mappings['gene_to_idx']
+    batch_to_id = mappings['batch_to_id']
+    celltype_to_id = mappings['celltype_to_id']
+        
+    # Build model
     model = AttentionEnhancedDualEncoderVAE(model_cfg).to(device)
     
-    # Load weights (EMA or standard)
+    # Set gene names for neighbor mixing
+    train_gene_names = list(gene_to_idx.keys())
+    model._set_gene_names(train_gene_names)
+    
+    # Initialize context embeddings
+    model._init_context_embeddings(len(batch_to_id), len(celltype_to_id))
+    
+    # Load weights
     if cfg.predict.use_ema and 'ema_state_dict' in ckpt:
-        print("✓ Using EMA weights")
         model.load_state_dict(ckpt['ema_state_dict'])
+        print(f"✓ Loaded EMA weights from {ckpt_path.name}")
     else:
-        print("Using standard weights")
         model.load_state_dict(ckpt['model_state_dict'])
+        print(f"✓ Loaded weights from {ckpt_path.name}")
     
     model.eval()
     
     # ========================================================================
-    # LOAD VOCABULARY MAPPINGS
+    # CONTROL POOL (load once, get everything!)
     # ========================================================================
     
-    # Load gene_to_idx from training for consistency
-    ckpt_dir = Path(cfg.predict.ckpt_path).parent
-    mapping_path = ckpt_dir / 'vocab_mappings.json'
+    print(f"\n{'─'*80}")
+    print(f"CONTROL POOL")
+    print(f"{'─'*80}")
     
-    gene_to_idx = None
-    if mapping_path.exists():
-        print(f"✓ Loading vocabulary mappings from {mapping_path}")
-        mappings = PerturbationDataset.load_mappings(mapping_path)
-        gene_to_idx = mappings.get('gene_to_idx')
-    else:
-        print(f"⚠ No vocabulary mappings found at {mapping_path} - Using test data gene order (may cause inconsistency!)")
-    
-    # ========================================================================
-    # LOAD DATA
-    # ========================================================================
-    
-    print(f"\nLoading test data from {cfg.predict.test_h5ad}")
-    test_loader = get_dataloader(
-        cfg.predict.test_h5ad,
-        cfg.data,
-        batch_size=cfg.predict.batch_size,
-        shuffle=False,
-        num_workers=cfg.data.num_workers,
-        gene_to_idx=gene_to_idx  # Use same mapping as training!
+    X_pool, obs_pool, pool_batch_vocab, pool_ct_vocab, global_median_depth, depth_by_batch, X_raw = load_control_pool(
+        cfg=cfg.data,
+        gene_to_idx=gene_to_idx,
+        h1_flag_value=cfg.predict.h1_flag_value,
     )
     
-    # Get dataset info
-    dataset = test_loader.dataset
-    num_batches_test = len(dataset.batch_to_id)
-    num_celltypes_test = len(dataset.celltype_to_id)
+    # Compute library sizes
+    libsize_log1p = np.log1p(np.expm1(X_pool).sum(axis=1)).astype(np.float32)
+    obs_pool['libsize_log1p'] = libsize_log1p
     
-    print(f"Test data:")
-    print(f"- Cells: {len(dataset):,}")
-    print(f"- Genes: {dataset.adata.n_vars}")
-    print(f"- Batches: {num_batches_test}")
-    print(f"- Cell types: {num_celltypes_test}")
+    pool_size = X_pool.shape[0]
+    out_var_index = pd.Index(train_gene_names, dtype=str)
     
-    # Initialize context embeddings if needed
-    if model.batch_emb is None or model.celltype_emb is None:
-        print(f"Initializing context embeddings...")
-        model._init_context_embeddings(num_batches_test, num_celltypes_test)
+    print(f"Pool statistics:")
+    print(f"- Cells: {pool_size:,}")
+    print(f"- Genes: {X_pool.shape[1]:,}")
+    print(f"- Global median depth: {global_median_depth:.1f} counts")
+    if depth_by_batch:
+        print(f"- Per-batch medians: {len(depth_by_batch)} batches")
     
     # ========================================================================
-    # GENERATE PREDICTIONS
+    # ENCODE CONTROLS
+    # ========================================================================
+
+    print(f"\n{'─'*80}")
+    print(f"ENCODING")
+    print(f"{'─'*80}")
+
+    # Prepare context
+    col_batch = cfg.data.col_batch
+    col_celltype = cfg.data.col_celltype
+    col_target = cfg.data.col_target
+    control_token = cfg.data.control_token
+
+    batch_ids = np.array([batch_to_id.get(str(b), 0) for b in obs_pool.get(col_batch, pd.Series(['unknown'] * len(obs_pool)))])
+    ct_ids = np.array([celltype_to_id.get(str(c), 0) for c in obs_pool.get(col_celltype, pd.Series(['unknown'] * len(obs_pool)))])
+    is_h1 = np.ones(len(obs_pool), dtype=np.int64)  # All H1
+
+    # Encode z_c
+    n_samples = getattr(cfg.predict, 'n_samples', 1)
+    zc_bank, context_bank = [], []
+
+    bs = cfg.predict.batch_size  # Use config batch size
+    with tqdm(total=pool_size, desc="Encoding controls", unit="cells") as pbar:
+        for sl in batched(range(pool_size), bs):
+            x_b = torch.from_numpy(X_pool[sl]).to(device).float()
+            
+            # Build batch dict (match training format exactly!)
+            batch_dict = {
+                'x': x_b,
+                'batch_idx': torch.from_numpy(batch_ids[sl]).to(device),
+                'celltype_idx': torch.from_numpy(ct_ids[sl]).to(device),
+                'is_h1': torch.from_numpy(is_h1[sl]).to(device),
+                'libsize': torch.from_numpy(libsize_log1p[sl]).to(device).float()
+            }
+            
+            if n_samples > 1:
+                # Repeat for multiple samples
+                for k in batch_dict:
+                    if isinstance(batch_dict[k], torch.Tensor):
+                        batch_dict[k] = batch_dict[k].repeat_interleave(n_samples, dim=0)
+            
+            # Encode
+            z_c, _, _ = model.encode_control(batch_dict['x'])
+            context = model.build_context(batch_dict)
+            
+            zc_bank.append(z_c)
+            context_bank.append(context)
+            
+            pbar.update(len(sl))
+    
+    zc_bank = torch.cat(zc_bank, dim=0)
+    context_bank = torch.cat(context_bank, dim=0)
+    
+    pool_size_eff = zc_bank.shape[0]
+    print(f"\n✓ Encoded {pool_size_eff:,} control representations")
+    print(f"- z_c shape: {tuple(zc_bank.shape)}")
+    print(f"- context shape: {tuple(context_bank.shape)}")
+    
+    # ========================================================================
+    # PERTURBATION LIST
     # ========================================================================
     
-    print(f"\nGenerating predictions...")
+    print(f"\n{'─'*80}")
+    print(f"PERTURBATION LIST")
+    print(f"{'─'*80}")
     
-    # Check if neighbor mixing should be used
-    use_neighbor_mixing = cfg.predict.use_neighbor_mixing
-    if use_neighbor_mixing:
-        print(f"✓ Using neighbor mixing for unseen genes:")
-        print(f"- k={cfg.predict.neighbor_mix_k}")
-        print(f"- tau={cfg.predict.neighbor_mix_tau}")
-        print(f"- include_self={cfg.predict.neighbor_mix_include_self}")
+    df_list = pd.read_csv(cfg.predict.perturb_list_csv)
     
-    if cfg.predict.delta_gain != 1.0:
-        print(f"✓ Applying delta gain: {cfg.predict.delta_gain}")
+    if 'target_gene' not in df_list.columns or 'n_cells' not in df_list.columns:
+        raise ValueError("perturb_list_csv must have columns: target_gene, n_cells")
     
-    all_predictions = []
-    all_attentions = []
+    print(f"Loaded perturbations:")
+    print(f"- Total: {len(df_list)}")
+    print(f"- Unique genes: {df_list['target_gene'].nunique()}")
+    print(f"- Total cells: {df_list['n_cells'].sum():,}")
     
-    # Multiple sampling support (for uncertainty estimation)
-    n_samples = cfg.predict.n_samples
-    if n_samples > 1:
-        print(f"✓ Generating {n_samples} samples per cell for uncertainty estimation")
+    # Depth column
+    depth_col = getattr(cfg.predict, 'depth_column', 'median_umi_per_cell')
+    has_depth = depth_col in df_list.columns
+    df_has_batch = col_batch in df_list.columns
     
-    for batch_idx, batch in enumerate(tqdm(test_loader, desc="Predicting")):
-        # Move to device
-        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
-                 for k, v in batch.items()}
+    if has_depth:
+        print(f"- Depth info: Found '{depth_col}' column")
+    else:
+        print(f"⚠ Depth info: Using global median ({global_median_depth:.1f})")
+    
+    def resolve_target_depth(row):
+        """Resolve target depth for a perturbation."""
+        if has_depth:
+            v = row.get(depth_col, np.nan)
+            if pd.notna(v) and np.isfinite(v) and float(v) > 0:
+                return float(v)
+        if df_has_batch:
+            b = str(row.get(col_batch, ''))
+            if b in depth_by_batch:
+                return depth_by_batch[b]
+        return global_median_depth
+    
+    # Neighbor mixing defaults
+    default_k = cfg.predict.neighbor_mix_k
+    default_tau = cfg.predict.neighbor_mix_tau
+    
+    print(f"\nNeighbor mixing:")
+    print(f"- k: {default_k}")
+    print(f"- tau: {default_tau}")
+    print(f"- include_self: {cfg.predict.neighbor_mix_include_self}")
+    
+    # ========================================================================
+    # GENERATE CELLS
+    # ========================================================================
+    
+    print(f"\n{'─'*80}")
+    print(f"GENERATION")
+    print(f"{'─'*80}")
+    
+    X_blocks, obs_blocks = [], []
+    output_scale = cfg.predict.output_scale.lower()
+    
+    # Optional: include real controls (fast - just index into X_raw!)
+    n_ctrl = getattr(cfg.predict, 'n_control_cells', 0)
+    include_real_ctrl = (n_ctrl is not None and n_ctrl != 0)
+    
+    if include_real_ctrl:
+        if n_ctrl == -1 or n_ctrl is None:
+            n_ctrl = pool_size
+        n_ctrl = min(n_ctrl, pool_size)
         
-        # ============================================================
-        # STANDARD PREDICTION (with optional neighbor mixing)
-        # ============================================================
+        idx_ctrl = np.random.choice(pool_size, size=n_ctrl, replace=False)
+        obs_ctrl = obs_pool.iloc[idx_ctrl].copy()
+        obs_ctrl[col_target] = control_token
+        obs_ctrl['is_synthetic'] = 0
         
-        if use_neighbor_mixing:
-            # Use neighbor mixing for better generalization to unseen genes
-            
-            # Encode controls
-            z_c, _, _ = model.encode_control(batch['x'])
-            context = model.build_context(batch)
-            gene_idx = batch['gene_idx']
-            
-            # Predict with neighbor mixing
-            k = cfg.predict.neighbor_mix_k if cfg.predict.neighbor_mix_k is not None else cfg.model.neighbor_mix_k
-            tau = cfg.predict.neighbor_mix_tau if cfg.predict.neighbor_mix_tau is not None else cfg.model.neighbor_mix_tau
-            include_self = cfg.predict.neighbor_mix_include_self if cfg.predict.neighbor_mix_include_self is not None else cfg.model.neighbor_mix_include_self
-            
-            x_pred, attn = model.predict_with_neighbor_mixing(
-                z_c=z_c,
-                context=context,
-                target_gene_idx=gene_idx,
-                k=k,
-                tau=tau,
-                include_self=include_self,
-                delta_gain=cfg.predict.delta_gain
-            )
-            
-            # Store attention if computed
-            if cfg.predict.compute_attention_maps and attn is not None:
-                all_attentions.append(attn.cpu().numpy())
-        
+        if output_scale == 'counts':
+            # Use pre-loaded raw counts (already in correct gene order!)
+            X_ctrl = X_raw[idx_ctrl]
+            obs_ctrl['median_umi_per_cell'] = global_median_depth
+            X_blocks.append(X_ctrl)
+            obs_blocks.append(obs_ctrl)
+            print(f"✓ Included {n_ctrl:,} real control cells (counts)")
         else:
-            # Standard forward pass
-            out = model(batch)
+            # Log1p (already in correct order)
+            X_ctrl = X_pool[idx_ctrl]
+            X_blocks.append(X_ctrl)
+            obs_blocks.append(obs_ctrl)
+            print(f"✓ Included {n_ctrl:,} real control cells (log1p)")
+    
+    # Generate per target
+    bs_gen = cfg.predict.batch_size  # Use config batch size
+    
+    print(f"\nGenerating perturbed cells...")
+    for _, row in tqdm(df_list.iterrows(), total=len(df_list), desc="Perturbations"):
+        tg = str(row['target_gene'])
+        n_cells = int(row['n_cells'])
+        target_depth = resolve_target_depth(row)
+        
+        # Get neighbor mixing params
+        k_tg, tau_tg = mix_params_for_target(
+            tg, gene_to_idx, control_token, default_k, default_tau
+        )
+        
+        gid = gene_to_idx.get(tg, 0)
+        idx = np.random.choice(pool_size_eff, size=n_cells, replace=(n_cells > pool_size_eff))
+        
+        zc_sel = zc_bank[idx]
+        context_sel = context_bank[idx]
+        
+        # ============================================================
+        # CONTROL/NON-TARGETING
+        # ============================================================
+        
+        if gid == 0 or tg == control_token:
+            obs_t = obs_pool.iloc[idx % len(obs_pool)].copy().reset_index(drop=True)
+            obs_t[col_target] = tg
+            obs_t['is_synthetic'] = 1
             
-            # Get predictions (control → perturbed)
-            if cfg.predict.delta_gain != 1.0:
-                # Apply delta gain
-                delta_scaled = out['delta'] * cfg.predict.delta_gain
-                x_pred = model.decode(out['z_c'] + delta_scaled, out['context'])
+            # Generate synthetic controls (decode without perturbation)
+            outs = []
+            for sl in batched(range(n_cells), bs_gen):
+                x_hat = model.decode(zc_sel[sl], context_sel[sl])
+                outs.append(x_hat.cpu().numpy())
+            
+            X_hat_log1p = np.concatenate(outs, axis=0)
+            
+            if output_scale == 'counts':
+                X_counts = sample_counts_from_log1p(X_hat_log1p, target_depth, cfg.predict)
+                obs_t['median_umi_per_cell'] = target_depth
+                X_blocks.append(X_counts)
+                obs_blocks.append(obs_t)
             else:
-                x_pred = out['x_pred_from_c']
-            
-            # Save attention if requested
-            if cfg.predict.compute_attention_maps and out['gene_attention'] is not None:
-                attn = out['gene_attention'].cpu().numpy()
-                all_attentions.append(attn)
+                X_blocks.append(X_hat_log1p)
+                obs_blocks.append(obs_t)
+            continue
         
-        # Move to CPU and store
-        x_pred = x_pred.cpu().numpy()
-        all_predictions.append(x_pred)
+        # ============================================================
+        # PERTURBATION
+        # ============================================================
+        
+        gid_t = torch.full((n_cells,), gid, device=device, dtype=torch.long)
+        outs = []
+        
+        for sl in batched(range(n_cells), bs_gen):
+            # Predict with neighbor mixing
+            x_hat, _ = model.predict_with_neighbor_mixing(
+                z_c=zc_sel[sl],
+                context=context_sel[sl],
+                target_gene_idx=gid_t[sl],
+                k=k_tg if k_tg > 0 else default_k,
+                tau=tau_tg if k_tg > 0 else default_tau,
+                include_self=cfg.predict.neighbor_mix_include_self,
+                delta_gain=getattr(cfg.predict, 'delta_gain', 1.0)
+            )
+            outs.append(x_hat.cpu().numpy())
+        
+        X_hat_log1p = np.concatenate(outs, axis=0)
+        
+        obs_t = obs_pool.iloc[idx % len(obs_pool)].copy().reset_index(drop=True)
+        obs_t[col_target] = tg
+        obs_t['is_synthetic'] = 1
+        
+        if output_scale == 'counts':
+            X_counts = sample_counts_from_log1p(X_hat_log1p, target_depth, cfg.predict)
+            obs_t['median_umi_per_cell'] = target_depth
+            X_blocks.append(X_counts)
+            obs_blocks.append(obs_t)
+        else:
+            X_blocks.append(X_hat_log1p)
+            obs_blocks.append(obs_t)
     
     # ========================================================================
-    # AGGREGATE RESULTS
+    # ASSEMBLY
     # ========================================================================
     
-    # Concatenate all batches
-    predictions = np.vstack(all_predictions)
+    print(f"\n{'─'*80}")
+    print(f"ASSEMBLY")
+    print(f"{'─'*80}")
     
-    if all_attentions:
-        attentions = np.vstack(all_attentions)
-        print(f"✓ Collected attention maps: {attentions.shape}")
+    any_sparse = any(sparse.issparse(b) for b in X_blocks)
+    if any_sparse:
+        X_out = sparse.vstack([
+            b.tocsr() if sparse.issparse(b) else sparse.csr_matrix(b) 
+            for b in X_blocks
+        ], format='csr')
     else:
-        attentions = None
+        X_out = np.vstack(X_blocks)
     
-    print(f"✓ Generated predictions: {predictions.shape}")
+    obs_out = pd.concat(obs_blocks, axis=0, ignore_index=True)
+    obs_out.index = obs_out.index.astype(str)
+    
+    var_out = pd.DataFrame(index=out_var_index)
+    
+    # Final cleanup
+    if output_scale == 'counts':
+        if sparse.issparse(X_out):
+            X_out.data = np.rint(X_out.data).clip(min=0).astype(np.int32)
+            X_out.eliminate_zeros()
+        else:
+            X_out = np.rint(X_out).clip(min=0).astype(np.int32)
+    else:
+        if 'median_umi_per_cell' in obs_out.columns:
+            obs_out = obs_out.drop(columns=['median_umi_per_cell'])
+    
+    adata_out = sc.AnnData(X_out, obs=obs_out, var=var_out)
+    adata_out.obs_names_make_unique()
+    adata_out.var_names_make_unique()
+    
+    print(f"Output shape: {adata_out.shape}")
+    print(f"- Cells: {adata_out.n_obs:,}")
+    print(f"- Genes: {adata_out.n_vars:,}")
+    print(f"- Targets: {obs_out[col_target].nunique()}")
+    
+    # Gene ordering
+    if cfg.predict.gene_order_file is not None:
+        adata_out = reorder_genes(adata_out, cfg.predict.gene_order_file)
+        print(f"✓ Reordered genes according to {cfg.predict.gene_order_file}")
     
     # ========================================================================
-    # SAVE RESULTS
+    # OUTPUT
     # ========================================================================
     
-    print(f"\nSaving to {cfg.predict.output_h5ad}")
+    print(f"\n{'─'*80}")
+    print(f"OUTPUT")
+    print(f"{'─'*80}")
     
-    # Load original test data to get metadata
-    adata_test = sc.read_h5ad(cfg.predict.test_h5ad)
-    
-    # Create new AnnData with predictions
-    adata_pred = sc.AnnData(
-        X=predictions,
-        obs=adata_test.obs.copy(),
-        var=adata_test.var.copy()
-    )
-    
-    # Add metadata
-    adata_pred.uns['prediction_config'] = {
-        'checkpoint': str(cfg.predict.ckpt_path),
-        'use_ema': cfg.predict.use_ema,
-        'delta_gain': cfg.predict.delta_gain,
-        'use_neighbor_mixing': use_neighbor_mixing,
-        'neighbor_mix_k': cfg.predict.neighbor_mix_k if use_neighbor_mixing else None,
-        'neighbor_mix_tau': cfg.predict.neighbor_mix_tau if use_neighbor_mixing else None,
-    }
-    
-    # Add attention maps to obsm if computed
-    if attentions is not None:
-        adata_pred.obsm['gene_attention'] = attentions
-        print("✓ Saved attention maps to .obsm['gene_attention']")
-    
-    # Save
-    output_path = Path(cfg.predict.output_h5ad)
+    output_path = Path(cfg.predict.out_h5ad)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    adata_pred.write_h5ad(output_path)
     
-    # ========================================================================
-    # SUMMARY
-    # ========================================================================
+    if output_scale == 'counts' and not sparse.issparse(adata_out.X):
+        adata_out.X = sparse.csr_matrix(adata_out.X)
     
-    print(f"\n")
-    print(f"PREDICTION COMPLETED")
-    print(f"- Input: {cfg.predict.test_h5ad}")
-    print(f"- Output: {cfg.predict.output_h5ad}")
-    print(f"- Predictions: {predictions.shape}")
-    if attentions is not None:
-        print(f"- Attention maps: {attentions.shape}")
-    print(f"- Method: {'Neighbor mixing' if use_neighbor_mixing else 'Standard'}")
-    print(f"{'='*80}")
-
-
-@torch.no_grad()
-def predict_with_uncertainty(
-    cfg: Config,
-    n_samples: int = 10
-) -> tuple:
-    """
-    Generate predictions with uncertainty estimation.
+    adata_out.write_h5ad(output_path, compression=getattr(cfg.predict, 'compression', 'gzip'))
     
-    Uses multiple samples from the VAE latent space to estimate
-    prediction uncertainty.
+    print(f"Saved: {output_path}")
     
-    Args:
-        cfg: Configuration
-        n_samples: Number of samples per cell
-    
-    Returns:
-        (mean_predictions, std_predictions, all_samples)
-    """
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    print(f"Generating {n_samples} samples per cell...")
-    
-    # Load model (same as predict())
-    ckpt = torch.load(cfg.predict.ckpt_path, map_location=device)
-    model_cfg = ckpt.get('config', cfg).model
-    model = AttentionEnhancedDualEncoderVAE(model_cfg).to(device)
-    
-    if cfg.predict.use_ema and 'ema_state_dict' in ckpt:
-        model.load_state_dict(ckpt['ema_state_dict'])
-    else:
-        model.load_state_dict(ckpt['model_state_dict'])
-    
-    model.eval()
-    
-    # Load data (same as predict())
-    ckpt_dir = Path(cfg.predict.ckpt_path).parent
-    mapping_path = ckpt_dir / 'vocab_mappings.json'
-    gene_to_idx = None
-    if mapping_path.exists():
-        mappings = PerturbationDataset.load_mappings(mapping_path)
-        gene_to_idx = mappings.get('gene_to_idx')
-    
-    test_loader = get_dataloader(
-        cfg.predict.test_h5ad,
-        cfg.data,
-        batch_size=cfg.predict.batch_size,
-        shuffle=False,
-        num_workers=cfg.data.num_workers,
-        gene_to_idx=gene_to_idx
-    )
-    
-    # Initialize embeddings
-    dataset = test_loader.dataset
-    model._init_context_embeddings(len(dataset.batch_to_id), len(dataset.celltype_to_id))
-    
-    # Collect samples
-    all_samples = []  # [n_samples, n_cells, n_genes]
-    
-    for sample_idx in range(n_samples):
-        print(f"[predict_uncertainty] Sample {sample_idx + 1}/{n_samples}")
+    if output_scale == 'counts':
+        depths = np.asarray(adata_out.X.sum(axis=1)).ravel() if sparse.issparse(adata_out.X) else adata_out.X.sum(axis=1)
+        nnz = adata_out.X.count_nonzero() if sparse.issparse(adata_out.X) else np.count_nonzero(adata_out.X)
+        sparsity = 100 * (1 - nnz / (adata_out.n_obs * adata_out.n_vars))
         
-        sample_predictions = []
-        
-        for batch in tqdm(test_loader, desc=f"Sample {sample_idx+1}", leave=False):
-            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
-                     for k, v in batch.items()}
-            
-            # Sample from latent space (not deterministic!)
-            z_c, _, _ = model.encode_control(batch['x'])  # Samples from q(z|x)
-            context = model.build_context(batch)
-            
-            # Predict delta
-            delta, _, _ = model.predict_delta(z_c, batch['gene_idx'], context)
-            
-            # Apply delta gain
-            delta = delta * cfg.predict.delta_gain
-            
-            # Decode
-            x_pred = model.decode(z_c + delta, context)
-            
-            sample_predictions.append(x_pred.cpu().numpy())
-        
-        all_samples.append(np.vstack(sample_predictions))
+        print(f"\nCount statistics:")
+        print(f"- Mean depth: {depths.mean():.1f}")
+        print(f"- Median depth: {np.median(depths):.1f}")
+        print(f"- Sparsity: {sparsity:.1f}%")
     
-    # Stack samples: [n_samples, n_cells, n_genes]
-    all_samples = np.stack(all_samples, axis=0)
-    
-    # Compute statistics
-    mean_predictions = all_samples.mean(axis=0)  # [n_cells, n_genes]
-    std_predictions = all_samples.std(axis=0)    # [n_cells, n_genes]
-    
-    print(f"Mean predictions: {mean_predictions.shape}")
-    print(f"Std predictions: {std_predictions.shape}")
-    print(f"Average uncertainty: {std_predictions.mean():.4f}")
-    
-    return mean_predictions, std_predictions, all_samples
+    print(f"\n{'─'*80}")
+    print(f"PREDICTION COMPLETE")
+    print(f"{'─'*80}\n")
