@@ -1,0 +1,209 @@
+# ============================================================================
+# DEVAE Stage 2 Training Configuration
+# ============================================================================
+# Fine-tuning with competition losses (attention focus, topk, lfc magnitude)
+# Based on stage1 weights, everything unfrozen, lower LR
+# ============================================================================
+
+# ============================================================================
+# DATA CONFIGURATION
+# ============================================================================
+data:
+  # Input data paths (same as stage 1)
+  train_h5ad: "../data/adata_Training.h5ad"
+  val_h5ad: null
+  fewshot_h1_h5ad: null
+  
+  # Column names
+  col_target: "target_gene"
+  col_batch: "batch"
+  col_celltype: "cell_type"
+  col_is_h1: "is_H1"
+  control_token: "non-targeting"
+  
+  # Preprocessing (same as stage 1)
+  zscore: false
+  normalize: true
+  target_sum: null
+  drop_all_zero: false
+  
+  # Data loading
+  num_workers: 8
+  pin_memory: true
+
+
+# ============================================================================
+# MODEL CONFIGURATION (Core Architecture)
+# ============================================================================
+model:
+  
+  # Dimensions (will be loaded from stage1 checkpoint)
+  input_dim: null  # Auto-detected
+  latent_dim: 128
+  hidden_dims: [1536, 768, 384]
+  context_dim: 256
+  gene_embed_dim: 128
+  
+  # ResidualMLP
+  use_residual_mlp: true
+  use_input_skip: true
+  
+  # Regularization
+  dropout: 0.2
+  layernorm: true
+  
+  # Attention mechanism
+  num_attention_heads: 4
+  attention_dropout: 0.1
+  use_attention: true
+  attention_mixing_alpha: 0.5
+  
+  # Delta prediction
+  delta_type: "attention"
+  delta_rank: 8
+  hyperdelta_use_ln: true
+  
+  # Decoder
+  use_film_in_decoder: true
+  bound_mode: "tanh"
+  output_min: 0.0
+  output_max: 8.0
+  
+  # Count head
+  use_count_head: true
+  count_link: "nb"
+  nb_theta: 10.0
+  zinb_pi_hidden: 128
+  attention_modulated_counts: true
+  
+  # Gene embeddings (use same as stage 1)
+  pretrained_gene_emb_path: "data/ESM2_pert_features.pt"
+  pretrained_norm: "l2"
+  pretrained_case_insensitive: true
+  use_pca_init: false
+  
+  # Library size
+  use_libsize_covariate: true
+  libsize_proj_hidden: 128
+  
+  # VAR variance
+  logvar_min: -4.0
+  logvar_max: 2.0
+  use_softplus_var: true
+  
+  # Neighbor mixing
+  neighbor_mix_k: 12
+  neighbor_mix_tau: 0.07
+  neighbor_mix_include_self: true
+
+# ============================================================================
+# TRAIN CONFIGURATION
+# ============================================================================
+train:
+  # ========================================================================
+  # I/O
+  # ========================================================================
+  
+  pretrained_outdir: "outputs/stage1"  # Load from stage1!
+  outdir: "outputs/stage2"
+  ckpt_name: "model.pt"
+  seed: 42
+  
+  # ========================================================================
+  # Training Schedule
+  # ========================================================================
+  
+  epochs_warmup: 0  # No warmup for stage 2
+  kl_warmup_epochs: 0  # KL already warmed in stage 1
+  epochs_main: 30  # Shorter fine-tuning
+  
+  # ========================================================================
+  # Optimization (LOWER LR for fine-tuning!)
+  # ========================================================================
+  
+  batch_size: 128
+  lr: 5.0e-5  # 10x lower than stage 1!
+  weight_decay: 5.0e-2
+  grad_clip: 1.0
+  huber_delta: 0.5
+  amp: false
+  reset_optimizer: false  # Keep optimizer state from stage 1
+  
+  # ========================================================================
+  # Freezing (NONE - everything unfrozen!)
+  # ========================================================================
+  
+  freeze_enc_c: false
+  freeze_enc_p: false
+  freeze_decoder_main: false
+  freeze_count_head: false
+  freeze_zinb_head: false
+  freeze_delta_module: false
+  freeze_attention: false
+  freeze_adapter: false
+  freeze_gene_emb: false
+  freeze_batch_emb: false
+  freeze_ct_emb: false
+  freeze_h1_emb: false
+  freeze_lib_proj: false
+  
+  # ========================================================================
+  # Loss Weights (Stage 2: Add competition losses!)
+  # ========================================================================
+  
+  # Stage 1 losses (keep but reduce slightly)
+  lambda_rec: 0.50  # Reduced from 0.70
+  lambda_kl: 0.02  # Same
+  lambda_xrec: 0.05  # Reduced from 0.10
+  lambda_delta: 0.10  # Reduced from 0.15
+  
+  # Auxiliary losses (still off)
+  lambda_orth: 0.0
+  lambda_nce: 0.0
+  lambda_smooth: 0.0
+  lambda_mmd: 0.0
+  
+  # Count losses (keep active)
+  lambda_count_rec: 0.20  # Reduced from 0.30
+  lambda_count_xrec: 0.05  # Reduced from 0.10
+  
+  # Competition losses (enable for stage 2!)
+  lambda_attention_focus: 0.5  # Encourage attention to focus on DE genes
+  lambda_topk_supervision: 0.0  # Disable focal loss (Stage 3 only)
+  lambda_lfc_magnitude: 1.0  # Direct supervision on LFC magnitudes
+  
+  # Auxiliary hyperparameters
+  nce_temperature: 0.2
+  smooth_k: 8
+  count_max_rate: 60000.0
+  
+  # ZINB regularization
+  lambda_zinb_pi_reg: 1.0e-4
+  zinb_pi_reg_type: "l2_logit"
+  zinb_beta_a: 1.0
+  zinb_beta_b: 9.0
+  
+  # Gene weighting
+  compute_gene_weights: false
+  
+  # ========================================================================
+  # EMA and Scheduler
+  # ========================================================================
+  
+  use_ema: true
+  ema_decay: 0.999
+  use_cosine: true
+  warmup_frac: 0.10
+  min_lr_ratio: 0.01
+  
+  pretrained_freeze_epochs: 0
+  pretrained_emb_lr_scale: 0.05
+  
+  # ========================================================================
+  # Logging & Checkpointing
+  # ========================================================================
+  
+  log_every: 20
+  save_every: 5
+  resume_from: null  # Will auto-load from pretrained_outdir
+  early_stop_patience: 15  # Shorter patience for stage 2

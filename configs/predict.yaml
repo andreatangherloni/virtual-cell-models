@@ -1,0 +1,147 @@
+# ============================================================================
+# AE-DEVAE Competition Prediction Configuration
+# ============================================================================
+# This config generates predictions for the Virtual Cell Challenge.
+# It loads a trained model, pools of H1 control cells, and a CSV list of
+# perturbations to generate, then outputs predictions in competition format.
+# ============================================================================
+
+# ============================================================================
+# DATA CONFIGURATION
+# ============================================================================
+data:
+  # ========================================================================
+  # Input Data Path
+  # ========================================================================
+  control_pool_h5ad: "../data/val_split_h1.h5ad"  # H5AD with H1 control cells
+  
+  # ========================================================================
+  # Column Names (must match training)
+  # ========================================================================
+  col_target: "target_gene"
+  col_batch: "batch"
+  col_celltype: "cell_type"
+  col_is_h1: "is_H1"
+  control_token: "non-targeting"
+  
+  # ========================================================================
+  # Preprocessing (must match training!)
+  # ========================================================================
+  normalize: true      # Apply library size normalization
+  target_sum: null     # null = use median depth (same as training)
+  zscore: false        # NEVER use z-score for prediction!
+  drop_all_zero: false # Don't filter genes
+
+
+# ============================================================================
+# MODEL CONFIGURATION (not used for prediction, but required for structure)
+# ============================================================================
+model:
+  # These should match training, but are loaded from checkpoint
+  latent_dim: 128
+  hidden_dims: [1536, 768, 384]
+  context_dim: 256
+  gene_embed_dim: 128
+  
+  # Neighbor mixing (used at inference)
+  neighbor_mix_k: 12
+  neighbor_mix_tau: 0.07
+  neighbor_mix_include_self: true
+
+
+# ============================================================================
+# PREDICTION CONFIGURATION
+# ============================================================================
+predict:
+  # ========================================================================
+  # Input/Output Paths
+  # ========================================================================
+  ckpt_path: "outputs/stage2/best_model.pt"        # Trained model checkpoint
+  perturb_list_csv: "../data/pert_counts_val_split_h1.csv"  # CSV: target_gene, n_cells, [median_umi_per_cell]
+  out_h5ad: "predictions.h5ad"                     # Output predictions
+  gene_order_file: "../data/gene_names.txt"                            # Optional: path to gene order file
+  
+  # ========================================================================
+  # Model Inference Settings
+  # ========================================================================
+  batch_size: 512          # Larger batch for faster inference
+  use_ema: true            # Use EMA weights (usually better)
+  delta_gain: 1.0          # Scale factor for perturbation effects (1.0=no scaling)
+  n_samples: 1             # Number of latent samples (1=deterministic, >1=uncertainty)
+  
+  # ========================================================================
+  # Neighbor Mixing for Unseen Genes
+  # ========================================================================
+  # These parameters control how the model handles genes not seen during training.
+  # The model will blend embeddings from k nearest neighbor genes.
+  
+  neighbor_mix_k: 12                # Number of nearest neighbors to blend
+  neighbor_mix_tau: 0.07            # Temperature for softmax weights (lower=sharper)
+  neighbor_mix_include_self: true   # Include the target gene itself in the mixture
+  
+  # ========================================================================
+  # Control Cell Settings
+  # ========================================================================
+  h1_flag_value: 1         # Value in col_is_h1 that indicates H1 cells
+  n_control_cells: 3818    # Number of real controls to include in output
+                           # 0 = none (only synthetic)
+                           # -1 = all available controls
+                           # N = random sample of N controls
+  
+  # ========================================================================
+  # Output Format
+  # ========================================================================
+  output_scale: "counts"   # "counts" = raw counts (for competition)
+                           # "log1p" = log1p-normalized (for analysis)
+  compression: "gzip"      # H5AD compression method
+  
+  # ========================================================================
+  # Count Sampling (when output_scale='counts')
+  # ========================================================================
+  # These parameters control how log1p predictions are converted to counts
+  
+  count_link: "nb"         # Sampling distribution:
+                           # "nb" = Negative Binomial (recommended)
+                           # "poisson" = Poisson
+                           # "round" = just round the rates
+  
+  nb_theta: 10.0           # NB dispersion parameter (lower=more variable)
+  count_max_rate: 60000.0  # Maximum rate to prevent extreme values
+  
+  # Depth matching
+  depth_column: "median_umi_per_cell"  # Column in CSV for target sequencing depth
+  
+  # ========================================================================
+  # Rate Shaping (Optional)
+  # ========================================================================
+  # These parameters can sharpen or adjust the predicted rates before sampling
+  
+  rate_sharpen_beta: 1.0   # Exponent for rate sharpening
+                           # 1.0 = no sharpening
+                           # >1.0 = sharpen (increase dynamic range)
+                           # <1.0 = flatten (decrease dynamic range)
+  
+  mix_sharpen_p: 0.0       # Mixing proportion for sharpened rates
+                           # 0.0 = use original rates
+                           # 1.0 = use fully sharpened rates
+                           # 0.5 = 50/50 mix
+  
+  # ========================================================================
+  # Post-processing (Optional)
+  # ========================================================================
+  # These can be used to prune low-count genes or boost high-count genes
+  
+  topk_keep_only: null     # Keep only top-K genes by count (null=keep all)
+  prune_quantile: null     # Prune genes below this quantile (null=no pruning)
+  
+  topk_boost_k: 0          # Number of top genes to boost (0=no boosting)
+  topk_boost_gamma: 1.0    # Boost multiplier for top-K genes
+
+
+
+# # ============================================================================
+# # TRAINING CONFIGURATION (not used for prediction, but required for structure)
+# # ============================================================================
+# train:
+#   outdir: "outputs/prediction"  # Just for config completeness
+#   seed: 42 -->

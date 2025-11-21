@@ -5,9 +5,12 @@
 # from scratch (or from pretrained gene embeddings).
 # ============================================================================
 
+# ============================================================================
+# DATA CONFIGURATION
+# ============================================================================
 data:
   # Input data paths
-  train_h5ad: "data/adata_Training.h5ad"
+  train_h5ad: "../data/adata_Training.h5ad"
   val_h5ad: null         # Optional validation set
   fewshot_h1_h5ad: null  # Optional H1 few-shot data
   
@@ -29,9 +32,9 @@ data:
   pin_memory: true
 
 
-# ========================================================================
-# Core Architecture
-# ========================================================================  
+# ============================================================================
+# MODEL CONFIGURATION (Core Architecture)
+# ============================================================================
 model:
   
   # Dimensions (input_dim will be auto-detected from data)
@@ -103,7 +106,9 @@ model:
   neighbor_mix_tau: 0.07
   neighbor_mix_include_self: true
 
-
+# ============================================================================
+# TRAIN CONFIGURATION
+# ============================================================================
 train:
   # ========================================================================
   # I/O
@@ -213,27 +218,3 @@ train:
   save_every: 5  # Save checkpoint every N epochs
   resume_from: null
   early_stop_patience: 30
-
-
-predict:
-  # ========================================================================
-  # Prediction Configuration (for stage 1 validation)
-  # ========================================================================
-  
-  test_h5ad: "data/adata_Test.h5ad"
-  output_h5ad: "outputs/stage1/predictions.h5ad"
-  ckpt_path: "outputs/stage1/best_model.pt"
-  
-  batch_size: 256
-  use_ema: true
-  delta_gain: 1.0  # No scaling for stage 1
-  
-  # ✅ Neighbor mixing (enable for final prediction!)
-  use_neighbor_mixing: false  # false for stage 1 (not needed yet)
-  neighbor_mix_k: 8
-  neighbor_mix_tau: 0.07
-  neighbor_mix_include_self: true
-  
-  # Inference options
-  compute_attention_maps: true
-  n_samples: 1  # >1 for uncertainty estimation
